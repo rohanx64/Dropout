@@ -138,7 +138,61 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
-def trace_mask(mask, scale, sigma, thresh, corner, speckle, trap,
+def smooth_contour_points(cnt, passes, alpha):
+  """Average points along a closed contour while preserving sharp anchors."""
+  if cnt is None or len(cnt) < 8:
+    return cnt
+  pts = cnt[:, 0, :].astype(np.float32)
+  for _ in range(passes):
+    prev2 = np.roll(pts, 2, axis=0)
+    prev = np.roll(pts, 1, axis=0)
+    nxt = np.roll(pts, -1, axis=0)
+    nxt2 = np.roll(pts, -2, axis=0)
+
+    # 5-point moving average along the curve.
+    avg = (prev2 + 2 * prev + 3 * pts + 2 * nxt + nxt2) / 9.0
+
+    # Preserve sharp corners so important anchors survive heavy polish.
+    v1 = pts - prev
+    v2 = nxt - pts
+    n1 = np.linalg.norm(v1, axis=1) + 1e-6
+    n2 = np.linalg.norm(v2, axis=1) + 1e-6
+    cosang = np.clip((v1 * v2).sum(1) / (n1 * n2), -1.0, 1.0)
+    corner_strength = np.clip((1.0 - cosang) * 0.5, 0.0, 1.0)
+    local_alpha = alpha * (1.0 - 0.82 * corner_strength)
+    pts = pts * (1.0 - local_alpha[:, None]) + avg * local_alpha[:, None]
+
+  out = np.round(pts).astype(np.int32).reshape((-1, 1, 2))
+  return out
+
+
+def contour_average_smooth_mask(on, polish):
+  """Smooth mask boundaries by averaging along contour points."""
+  if polish <= 0:
+    return on
+  m = (on.astype(np.uint8) * 255)
+  contours, hierarchy = cv2.findContours(m, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+  if not contours or hierarchy is None:
+    return on
+
+  passes = 1 + int(round(polish * 5))
+  alpha = 0.22 + 0.5 * polish
+  hierarchy = hierarchy[0]
+  out = np.zeros_like(m)
+
+  for i, c in enumerate(contours):
+    if len(c) < 8 or abs(cv2.contourArea(c)) < 6:
+      smoothed = c
+    else:
+      smoothed = smooth_contour_points(c, passes, alpha)
+    is_hole = hierarchy[i][3] != -1
+    color = 0 if is_hole else 255
+    cv2.drawContours(out, [smoothed], -1, color, thickness=cv2.FILLED)
+
+  return out > 127
+
+
+def trace_mask(mask, scale, sigma, thresh, corner, speckle, trap, polish,
                length_threshold, splice_threshold, max_iterations, path_precision,
                tmpdir, name):
     # Linear interpolation keeps contours smooth without the stair-step look
@@ -156,6 +210,11 @@ def trace_mask(mask, scale, sigma, thresh, corner, speckle, trap,
         r = max(1, int(round(trap * scale)))
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
         on = cv2.dilate(on.astype(np.uint8), k) > 0
+
+    # Optional post-process polish pass (after core tracing settings):
+    # average points along each contour for Illustrator-like curve smoothing.
+    on = contour_average_smooth_mask(on, polish)
+
     binary = np.where(on, 0, 255).astype(np.uint8)   # VTracer traces dark pixels
 
     png = os.path.join(tmpdir, name + ".png")
@@ -213,6 +272,7 @@ def run_trace(rgba, palette, p):
     corner = clamp(float(p.get("corner", 28)), 1.0, 100.0)
     speckle = clamp(float(p.get("speckle", 0.25)), 0.0, 20.0)
     trap = clamp(float(p.get("trap", 0)), 0.0, 10.0)
+    polish = clamp(float(p.get("polish", 0.0)), 0.0, 1.0)
 
     # Higher simplify should smooth long curves without deleting important
     # anchors, so keep pruning mild and drive smoothing mostly through sigma.
@@ -240,7 +300,7 @@ def run_trace(rgba, palette, p):
                 continue
             top = order == len(kept) - 1
             paths = trace_mask(mask, scale, sigma, thresh, corner, speckle,
-                               0 if top else trap,
+                               0 if top else trap, polish,
                                length_threshold, splice_threshold,
                                max_iterations, path_precision,
                                tmp, "layer%d" % i)
@@ -527,7 +587,7 @@ input[type=range]{width:100%;margin:0;accent-color:var(--accent)}
       <p class="note">Everything set to Drop is removed from the trace. Pixels are matched to the nearest color, so soft edges land on the right side.</p>
     </div>
     <div class="sec"><h2>Edges</h2><div id="gEdges"></div>
-      <p class="note">Fill weight grows or shrinks filled regions before tracing. Path simplification removes tiny turns for cleaner curves.</p></div>
+      <p class="note">Fill weight grows or shrinks filled regions before tracing. Path simplification removes tiny turns. Curve averaging smooths points along each contour as a final polish pass.</p></div>
     <div class="sec"><h2>Cleanup</h2><div id="gClean"></div>
       <p class="note">Dark grey cutoff applies when a black or grey color is set to Drop.</p></div>
     <div class="sec"><h2>Print <button class="link" id="reset">Reset all</button></h2><div id="gPrint"></div>
@@ -560,13 +620,14 @@ input[type=range]{width:100%;margin:0;accent-color:var(--accent)}
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 
-const DEFAULTS = { corner: 28, thick: 0.5, sigma: 0.125, speckle: 0.25, simplify: 0.35, dark: 110, alpha: 128, trap: 0 };
+const DEFAULTS = { corner: 28, thick: 0.5, sigma: 0.125, speckle: 0.25, simplify: 0.35, polish: 0.0, dark: 110, alpha: 128, trap: 0 };
 const SLIDERS = [
   { g: "gEdges", k: "corner",  label: "Corners",            min: 5, max: 90, step: 1,    lo: "Sharp",    hi: "Smooth",    fmt: v => v + "°" },
   { g: "gEdges", k: "thick",   label: "Fill weight",        min: 0, max: 1,  step: .01,  lo: "Lighter",  hi: "Heavier",   fmt: v => (v >= .5 ? "+" : "") + Math.round((v - .5) * 100) + "%" },
   { g: "gEdges", k: "sigma",   label: "Edge softness",      min: 0, max: .5, step: .005, lo: "Crisp",    hi: "Soft",      fmt: v => v.toFixed(2) + " px" },
   { g: "gEdges", k: "speckle", label: "Speckle cleanup",    min: 0, max: 8,  step: .25,  lo: "Keep all", hi: "More cleanup",  fmt: v => v.toFixed(2) + " px" },
   { g: "gEdges", k: "simplify",label: "Path simplification",min: 0, max: 1,  step: .01,  lo: "More detail", hi: "Smoother", fmt: v => Math.round(v * 100) + "%" },
+  { g: "gEdges", k: "polish",  label: "Curve averaging",    min: 0, max: 1,  step: .01,  lo: "Off",      hi: "Maximum",   fmt: v => Math.round(v * 100) + "%" },
   { g: "gClean", k: "dark",    label: "Dark grey cutoff",   min: 0, max: 200, step: 1,   lo: "Black only", hi: "Dark greys", fmt: v => String(v) },
   { g: "gClean", k: "alpha",   label: "Edge transparency",  min: 1, max: 254, step: 1,   lo: "Keep more", hi: "Keep less", fmt: v => String(v) },
   { g: "gPrint", k: "trap",    label: "Trapping",           min: 0, max: 3,  step: .25,  lo: "None",     hi: "Heavy",     fmt: v => v.toFixed(2) + " px" },
@@ -633,7 +694,8 @@ function show(on) {
 function params() {
   const p = S.params;
   return { scale: S.scale, corner: p.corner, thresh: 0.70 - 0.28 * p.thick, sigma: p.sigma,
-           speckle: p.speckle, simplify: p.simplify, dark: p.dark, alpha: p.alpha, trap: p.trap };
+           speckle: p.speckle, simplify: p.simplify, polish: p.polish,
+           dark: p.dark, alpha: p.alpha, trap: p.trap };
 }
 
 function schedule(ms = 320) { clearTimeout(S.timer); S.timer = setTimeout(trace, ms); }
