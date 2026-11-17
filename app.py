@@ -208,18 +208,26 @@ def run_trace(rgba, palette, p):
     lab, keep = classify(rgba, palette, float(p.get("dark", 110)))
     solid = rgba[..., 3] >= float(p.get("alpha", 128))
 
-    sigma = clamp(float(p.get("sigma", 0.125)), 0.0, 0.8) * scale
+    base_sigma = clamp(float(p.get("sigma", 0.125)), 0.0, 0.8) * scale
     thresh = clamp(float(p.get("thresh", 0.56)), 0.05, 0.95)
     corner = clamp(float(p.get("corner", 28)), 1.0, 100.0)
     speckle = clamp(float(p.get("speckle", 0.25)), 0.0, 20.0)
     trap = clamp(float(p.get("trap", 0)), 0.0, 10.0)
 
-    # Higher simplify -> fewer tiny turns/paths, cleaner curves.
+    # Higher simplify should smooth long curves without deleting important
+    # anchors, so keep pruning mild and drive smoothing mostly through sigma.
     simplify = clamp(float(p.get("simplify", 0.35)), 0.0, 1.0)
-    length_threshold = 2.0 + simplify * 14.0
-    splice_threshold = 30.0 + simplify * 135.0
-    max_iterations = int(round(22 - simplify * 10))
-    path_precision = 3 if simplify < 0.55 else 2
+    sigma = base_sigma + (0.18 * simplify * scale)
+    sigma = clamp(sigma, 0.0, 1.4 * scale)
+
+    # Keep these ranges conservative to avoid wiping small anchors.
+    length_threshold = 2.0 + simplify * 5.0
+    splice_threshold = 35.0 + simplify * 65.0
+    max_iterations = int(round(24 + simplify * 4))
+    path_precision = 3
+
+    # Counterbalance simplification so corner-heavy shapes keep key points.
+    corner = clamp(corner - simplify * 6.0, 1.0, 100.0)
 
     kept = [i for i, k in enumerate(keep) if k]
     parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d">'
@@ -518,7 +526,8 @@ input[type=range]{width:100%;margin:0;accent-color:var(--accent)}
       </button>
       <p class="note">Everything set to Drop is removed from the trace. Pixels are matched to the nearest color, so soft edges land on the right side.</p>
     </div>
-    <div class="sec"><h2>Edges</h2><div id="gEdges"></div></div>
+    <div class="sec"><h2>Edges</h2><div id="gEdges"></div>
+      <p class="note">Fill weight grows or shrinks filled regions before tracing. Path simplification removes tiny turns for cleaner curves.</p></div>
     <div class="sec"><h2>Cleanup</h2><div id="gClean"></div>
       <p class="note">Dark grey cutoff applies when a black or grey color is set to Drop.</p></div>
     <div class="sec"><h2>Print <button class="link" id="reset">Reset all</button></h2><div id="gPrint"></div>
@@ -554,9 +563,9 @@ const $$ = (s) => [...document.querySelectorAll(s)];
 const DEFAULTS = { corner: 28, thick: 0.5, sigma: 0.125, speckle: 0.25, simplify: 0.35, dark: 110, alpha: 128, trap: 0 };
 const SLIDERS = [
   { g: "gEdges", k: "corner",  label: "Corners",            min: 5, max: 90, step: 1,    lo: "Sharp",    hi: "Smooth",    fmt: v => v + "°" },
-  { g: "gEdges", k: "thick",   label: "Shape thickness",    min: 0, max: 1,  step: .01,  lo: "Thinner",  hi: "Thicker",   fmt: v => (v >= .5 ? "+" : "") + Math.round((v - .5) * 100) + "%" },
+  { g: "gEdges", k: "thick",   label: "Fill weight",        min: 0, max: 1,  step: .01,  lo: "Lighter",  hi: "Heavier",   fmt: v => (v >= .5 ? "+" : "") + Math.round((v - .5) * 100) + "%" },
   { g: "gEdges", k: "sigma",   label: "Edge softness",      min: 0, max: .5, step: .005, lo: "Crisp",    hi: "Soft",      fmt: v => v.toFixed(2) + " px" },
-  { g: "gEdges", k: "speckle", label: "Smallest detail",    min: 0, max: 8,  step: .25,  lo: "Keep all", hi: "Clean up",  fmt: v => v.toFixed(2) + " px" },
+  { g: "gEdges", k: "speckle", label: "Speckle cleanup",    min: 0, max: 8,  step: .25,  lo: "Keep all", hi: "More cleanup",  fmt: v => v.toFixed(2) + " px" },
   { g: "gEdges", k: "simplify",label: "Path simplification",min: 0, max: 1,  step: .01,  lo: "More detail", hi: "Smoother", fmt: v => Math.round(v * 100) + "%" },
   { g: "gClean", k: "dark",    label: "Dark grey cutoff",   min: 0, max: 200, step: 1,   lo: "Black only", hi: "Dark greys", fmt: v => String(v) },
   { g: "gClean", k: "alpha",   label: "Edge transparency",  min: 1, max: 254, step: 1,   lo: "Keep more", hi: "Keep less", fmt: v => String(v) },
