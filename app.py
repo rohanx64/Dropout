@@ -134,11 +134,23 @@ def classify(rgba, palette, dark_cutoff):
     return lab, keep
 
 
-def trace_mask(mask, scale, sigma, thresh, corner, speckle, trap, tmpdir, name):
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def trace_mask(mask, scale, sigma, thresh, corner, speckle, trap,
+               length_threshold, splice_threshold, max_iterations, path_precision,
+               tmpdir, name):
+    # Linear interpolation keeps contours smooth without the stair-step look
+    # that nearest-neighbor introduces on diagonals.
     big = cv2.resize(mask.astype(np.uint8) * 255, None, fx=scale, fy=scale,
-                     interpolation=cv2.INTER_CUBIC)
+                     interpolation=cv2.INTER_LINEAR)
     if sigma > 0:
         big = cv2.GaussianBlur(big, (0, 0), sigma)
+    elif scale > 1:
+        # Mild blur at upscaled sizes reduces quantization jaggies while
+        # preserving shape fidelity.
+        big = cv2.GaussianBlur(big, (0, 0), 0.35 * scale)
     on = big > int(thresh * 255)
     if trap > 0:
         r = max(1, int(round(trap * scale)))
@@ -152,32 +164,36 @@ def trace_mask(mask, scale, sigma, thresh, corner, speckle, trap, tmpdir, name):
 
     # Run vtracer in a child process so native crashes don't take down Flask.
     child_code = (
-      "import vtracer\n"
-      "vtracer.convert_image_to_svg_py(\n"
-      "    r'''{png}''', r'''{svg}''', colormode='binary', mode='spline',\n"
-      "    filter_speckle={speckle}, corner_threshold={corner},\n"
-      "    length_threshold=3.5, splice_threshold=45, path_precision=3,\n"
-      "    max_iterations=15,\n"
-      ")\n"
+        "import vtracer\n"
+        "vtracer.convert_image_to_svg_py(\n"
+        "    r'''{png}''', r'''{svg}''', colormode='binary', mode='spline',\n"
+        "    filter_speckle={speckle}, corner_threshold={corner},\n"
+        "    length_threshold={length_threshold}, splice_threshold={splice_threshold},\n"
+        "    path_precision={path_precision}, max_iterations={max_iterations},\n"
+        ")\n"
     ).format(
-      png=png,
-      svg=svg,
-      speckle=max(1, int(round(speckle * scale))),
-      corner=int(corner),
+        png=png,
+        svg=svg,
+        speckle=max(1, int(round(speckle * scale))),
+        corner=int(corner),
+        length_threshold=round(length_threshold, 2),
+        splice_threshold=int(round(splice_threshold)),
+        path_precision=int(path_precision),
+        max_iterations=int(max_iterations),
     )
     proc = subprocess.run(
-      [sys.executable, "-c", child_code],
-      capture_output=True,
-      text=True,
+        [sys.executable, "-c", child_code],
+        capture_output=True,
+        text=True,
     )
     if proc.returncode != 0:
-      raise RuntimeError(
-        "vtracer failed (code %s)%s"
-        % (
-          proc.returncode,
-          ": " + proc.stderr.strip() if proc.stderr.strip() else "",
+        raise RuntimeError(
+            "vtracer failed (code %s)%s"
+            % (
+                proc.returncode,
+                ": " + proc.stderr.strip() if proc.stderr.strip() else "",
+            )
         )
-      )
 
     with open(svg) as f:
         text = f.read()
@@ -192,11 +208,18 @@ def run_trace(rgba, palette, p):
     lab, keep = classify(rgba, palette, float(p.get("dark", 110)))
     solid = rgba[..., 3] >= float(p.get("alpha", 128))
 
-    sigma = float(p.get("sigma", 0.125)) * scale
-    thresh = float(p.get("thresh", 0.56))
-    corner = float(p.get("corner", 28))
-    speckle = float(p.get("speckle", 0.25))
-    trap = float(p.get("trap", 0))
+    sigma = clamp(float(p.get("sigma", 0.125)), 0.0, 0.8) * scale
+    thresh = clamp(float(p.get("thresh", 0.56)), 0.05, 0.95)
+    corner = clamp(float(p.get("corner", 28)), 1.0, 100.0)
+    speckle = clamp(float(p.get("speckle", 0.25)), 0.0, 20.0)
+    trap = clamp(float(p.get("trap", 0)), 0.0, 10.0)
+
+    # Higher simplify -> fewer tiny turns/paths, cleaner curves.
+    simplify = clamp(float(p.get("simplify", 0.35)), 0.0, 1.0)
+    length_threshold = 2.0 + simplify * 14.0
+    splice_threshold = 30.0 + simplify * 135.0
+    max_iterations = int(round(22 - simplify * 10))
+    path_precision = 3 if simplify < 0.55 else 2
 
     kept = [i for i, k in enumerate(keep) if k]
     parts = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 %d %d" width="%d" height="%d">'
@@ -209,7 +232,10 @@ def run_trace(rgba, palette, p):
                 continue
             top = order == len(kept) - 1
             paths = trace_mask(mask, scale, sigma, thresh, corner, speckle,
-                               0 if top else trap, tmp, "layer%d" % i)
+                               0 if top else trap,
+                               length_threshold, splice_threshold,
+                               max_iterations, path_precision,
+                               tmp, "layer%d" % i)
             total += len(paths)
             parts.append('<g id="color-%s" fill="%s">' % (palette[i]["hex"].lstrip("#"), palette[i]["hex"]))
             parts += ['<path d="%s" transform="%s"/>' % (d, t) for d, t in paths]
@@ -525,12 +551,13 @@ input[type=range]{width:100%;margin:0;accent-color:var(--accent)}
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
 
-const DEFAULTS = { corner: 28, thick: 0.5, sigma: 0.125, speckle: 0.25, dark: 110, alpha: 128, trap: 0 };
+const DEFAULTS = { corner: 28, thick: 0.5, sigma: 0.125, speckle: 0.25, simplify: 0.35, dark: 110, alpha: 128, trap: 0 };
 const SLIDERS = [
   { g: "gEdges", k: "corner",  label: "Corners",            min: 5, max: 90, step: 1,    lo: "Sharp",    hi: "Smooth",    fmt: v => v + "°" },
   { g: "gEdges", k: "thick",   label: "Shape thickness",    min: 0, max: 1,  step: .01,  lo: "Thinner",  hi: "Thicker",   fmt: v => (v >= .5 ? "+" : "") + Math.round((v - .5) * 100) + "%" },
   { g: "gEdges", k: "sigma",   label: "Edge softness",      min: 0, max: .5, step: .005, lo: "Crisp",    hi: "Soft",      fmt: v => v.toFixed(2) + " px" },
   { g: "gEdges", k: "speckle", label: "Smallest detail",    min: 0, max: 8,  step: .25,  lo: "Keep all", hi: "Clean up",  fmt: v => v.toFixed(2) + " px" },
+  { g: "gEdges", k: "simplify",label: "Path simplification",min: 0, max: 1,  step: .01,  lo: "More detail", hi: "Smoother", fmt: v => Math.round(v * 100) + "%" },
   { g: "gClean", k: "dark",    label: "Dark grey cutoff",   min: 0, max: 200, step: 1,   lo: "Black only", hi: "Dark greys", fmt: v => String(v) },
   { g: "gClean", k: "alpha",   label: "Edge transparency",  min: 1, max: 254, step: 1,   lo: "Keep more", hi: "Keep less", fmt: v => String(v) },
   { g: "gPrint", k: "trap",    label: "Trapping",           min: 0, max: 3,  step: .25,  lo: "None",     hi: "Heavy",     fmt: v => v.toFixed(2) + " px" },
@@ -597,7 +624,7 @@ function show(on) {
 function params() {
   const p = S.params;
   return { scale: S.scale, corner: p.corner, thresh: 0.70 - 0.28 * p.thick, sigma: p.sigma,
-           speckle: p.speckle, dark: p.dark, alpha: p.alpha, trap: p.trap };
+           speckle: p.speckle, simplify: p.simplify, dark: p.dark, alpha: p.alpha, trap: p.trap };
 }
 
 function schedule(ms = 320) { clearTimeout(S.timer); S.timer = setTimeout(trace, ms); }
