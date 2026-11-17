@@ -1,0 +1,6 @@
+flask
+vtracer
+opencv-python
+numpy
+pillow
+cairosvg
